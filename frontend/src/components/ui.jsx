@@ -40,6 +40,11 @@ const STATUS_STYLE = {
   normal: 'green', faulty: 'red', maintenance: 'amber',
   explained: 'green',
   shareholder: 'blue', public_only: 'gray',
+  // 停机事件
+  assessed: 'blue', recovered: 'green', closed: 'gray',
+  covered: 'green', shortfall: 'red', surplus: 'blue',
+  quality: 'red', channel: 'amber', mixed: 'amber',
+  done: 'green', dismissed: 'gray',
 }
 export function Badge({ value }) {
   return <span className={'badge ' + (STATUS_STYLE[value] || 'gray')}>{value}</span>

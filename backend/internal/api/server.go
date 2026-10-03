@@ -65,13 +65,34 @@ func (s *Server) Router() http.Handler {
 		// 设备与发电
 		r.Get("/buildings/{id}/inverters", s.listInverters)
 		r.Post("/buildings/{id}/inverters", s.createInverter)
+		r.Patch("/inverters/{iid}", s.updateInverter)
 		r.Post("/inverters/{iid}/fault", s.faultInverter)
 		r.Post("/inverters/{iid}/resolve", s.resolveInverter)
 		r.Get("/buildings/{id}/generation", s.listGeneration)
 		r.Post("/buildings/{id}/generation", s.uploadGeneration)
+		r.Get("/buildings/{id}/generation-curve", s.listCurve)
+		r.Put("/buildings/{id}/generation-curve", s.upsertCurve)
+		r.Post("/buildings/{id}/generation-curve/batch", s.batchCurve)
 		r.Get("/buildings/{id}/alerts", s.listAlerts)
 		r.Post("/buildings/{id}/alerts", s.createAlert)
 		r.Post("/alerts/{aid}/explain", s.explainAlert)
+
+		// 设备绑定组件
+		r.Get("/buildings/{id}/panel-bindings", s.listBindings)
+		r.Put("/buildings/{id}/panel-bindings", s.upsertBinding)
+		r.Post("/buildings/{id}/panel-bindings/auto", s.autoBindings)
+		r.Delete("/panel-bindings/{bid}", s.deleteBinding)
+
+		// 逆变器停机故障影响分摊
+		r.Get("/buildings/{id}/outages", s.listOutages)
+		r.Post("/buildings/{id}/outages", s.createOutage)
+		r.Get("/outages/{oid}", s.getOutage)
+		r.Post("/outages/{oid}/timeline", s.updateOutageTimeline)
+		r.Post("/outages/{oid}/assess", s.assessOutage)
+		r.Post("/outages/{oid}/post-compensation", s.postOutageCompensation)
+		r.Post("/outages/{oid}/review", s.reviewOutage)
+		r.Get("/buildings/{id}/rechecks", s.listRechecks)
+		r.Post("/rechecks/{rid}", s.handleRecheck)
 
 		// 维修工单
 		r.Get("/buildings/{id}/work-orders", s.listWorkOrders)

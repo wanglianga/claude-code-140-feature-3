@@ -38,7 +38,7 @@ export default function OverviewTab({ user, building, dash, reload }) {
 
   return (
     <>
-      <div className="grid grid-4">
+      <div className="grid grid-5">
         <div className="card stat accent">
           <div className="label">累计发电</div>
           <div className="value">{fmtNum(dash?.total_kwh)} <span className="small">kWh</span></div>
@@ -58,6 +58,14 @@ export default function OverviewTab({ user, building, dash, reload }) {
           <div className="label">维修工单</div>
           <div className="value">{dash?.work_orders_open || 0} <span className="small">待处理</span></div>
           <div className="sub">已解决 {dash?.work_orders_resolved || 0} 件</div>
+        </div>
+        <div className="card stat">
+          <div className="label">逆变器停机分摊</div>
+          <div className="value">{dash?.outages_open || 0} <span className="small">未闭环</span></div>
+          <div className="sub">
+            共 {dash?.outages_total || 0} 起 · 待复查 {dash?.rechecks_open || 0}
+            {Number(dash?.outage_compensation_posted || 0) > 0 && ` · 已入账 ¥${fmtMoney(dash?.outage_compensation_posted)}`}
+          </div>
         </div>
       </div>
 

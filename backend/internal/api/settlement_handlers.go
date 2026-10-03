@@ -558,6 +558,18 @@ func (s *Server) buildingDashboard(w http.ResponseWriter, r *http.Request) {
 		`SELECT count(*) FILTER (WHERE status<>'resolved'), count(*) FILTER (WHERE status='resolved')
 		 FROM work_orders WHERE building_id=$1`, bid).Scan(&woOpen, &woResolved)
 
+	// 逆变器停机故障影响分摊统计
+	var outageOpen, outageTotal, recheckOpen int
+	var outageCompPosted float64
+	_ = s.Pool.QueryRow(r.Context(), `
+		SELECT count(*) FILTER (WHERE status<>'closed'),
+		       count(*),
+		       COALESCE(SUM(supplier_paid_amount+property_paid_amount) FILTER (WHERE posted_to_ledger),0)
+		FROM inverter_outage_events WHERE building_id=$1`,
+		bid).Scan(&outageOpen, &outageTotal, &outageCompPosted)
+	_ = s.Pool.QueryRow(r.Context(),
+		`SELECT count(*) FROM outage_rechecks WHERE building_id=$1 AND status='open'`, bid).Scan(&recheckOpen)
+
 	rows, err := s.Pool.Query(r.Context(), `
 		SELECT period_month, total_kwh, gross_revenue, total_subsidy, distributable, status
 		FROM settlement_periods WHERE building_id=$1 ORDER BY period_month`, bid)
@@ -594,6 +606,10 @@ func (s *Server) buildingDashboard(w http.ResponseWriter, r *http.Request) {
 	d["resident_count"] = residentCount
 	d["work_orders_open"] = woOpen
 	d["work_orders_resolved"] = woResolved
+	d["outages_open"] = outageOpen
+	d["outages_total"] = outageTotal
+	d["outage_compensation_posted"] = outageCompPosted
+	d["rechecks_open"] = recheckOpen
 	d["monthly_series"] = series
 	writeJSON(w, 200, d)
 }

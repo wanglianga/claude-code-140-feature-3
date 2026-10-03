@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"pvplatform/internal/auth"
 )
@@ -18,6 +19,10 @@ func (s *Server) createInverter(w http.ResponseWriter, r *http.Request) {
 		Name          string  `json:"name"`
 		CapacityKw    float64 `json:"capacity_kw"`
 		CapacityRatio float64 `json:"capacity_ratio"`
+		Model         string  `json:"model"`
+		Supplier      string  `json:"supplier"`
+		WarrantyUntil string  `json:"warranty_until"`
+		InstalledAt   string  `json:"installed_at"`
 	}
 	if err := decodeJSON(r, &in); err != nil || in.Name == "" {
 		writeErr(w, 400, "逆变器名称必填")
@@ -30,10 +35,28 @@ func (s *Server) createInverter(w http.ResponseWriter, r *http.Request) {
 			in.CapacityRatio = in.CapacityKw / total * 100
 		}
 	}
+	var warranty, installed any
+	if in.WarrantyUntil != "" {
+		if t, err := time.Parse("2006-01-02", in.WarrantyUntil); err != nil {
+			writeErr(w, 400, "保修截止日期格式应为 YYYY-MM-DD")
+			return
+		} else {
+			warranty = t
+		}
+	}
+	if in.InstalledAt != "" {
+		if t, err := time.Parse("2006-01-02", in.InstalledAt); err != nil {
+			writeErr(w, 400, "安装日期格式应为 YYYY-MM-DD")
+			return
+		} else {
+			installed = t
+		}
+	}
 	var id int64
 	err := s.Pool.QueryRow(r.Context(),
-		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio) VALUES ($1,$2,$3,$4) RETURNING id`,
-		bid, in.Name, in.CapacityKw, in.CapacityRatio).Scan(&id)
+		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio,model,supplier,warranty_until,installed_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+		bid, in.Name, in.CapacityKw, in.CapacityRatio, in.Model, in.Supplier, warranty, installed).Scan(&id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -47,7 +70,8 @@ func (s *Server) listInverters(w http.ResponseWriter, r *http.Request) {
 	}
 	bid := urlID(r, "id")
 	rows, err := s.Pool.Query(r.Context(), `
-		SELECT id, name, capacity_kw, capacity_ratio, status, COALESCE(fault_note,''), fault_at
+		SELECT id, name, capacity_kw, capacity_ratio, status, COALESCE(fault_note,''), fault_at,
+		       COALESCE(model,''), COALESCE(supplier,''), warranty_until::text, installed_at::text
 		FROM inverters WHERE building_id=$1 ORDER BY id`, bid)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -59,15 +83,18 @@ func (s *Server) listInverters(w http.ResponseWriter, r *http.Request) {
 		var id int64
 		var name string
 		var kw, ratio float64
-		var status, note string
-		var faultAt *string
-		if err := rows.Scan(&id, &name, &kw, &ratio, &status, &note, &faultAt); err != nil {
+		var status, note, model, supplier string
+		var faultAt, warranty, installed *string
+		if err := rows.Scan(&id, &name, &kw, &ratio, &status, &note, &faultAt,
+			&model, &supplier, &warranty, &installed); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
 		out = append(out, map[string]any{
 			"id": id, "name": name, "capacity_kw": kw, "capacity_ratio": ratio,
 			"status": status, "fault_note": note, "fault_at": faultAt,
+			"model": model, "supplier": supplier,
+			"warranty_until": warranty, "installed_at": installed,
 		})
 	}
 	writeJSON(w, 200, map[string]any{"items": out})

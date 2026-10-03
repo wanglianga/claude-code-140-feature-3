@@ -4,11 +4,13 @@ package seed
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"pvplatform/internal/auth"
+	"pvplatform/internal/outage"
 	"pvplatform/internal/settlement"
 )
 
@@ -120,17 +122,34 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 
-	// 两台逆变器
+	// 两台逆变器（同型号同供应商，5 年保修，2026-04 装机）
 	var inv1, inv2 int64
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio) VALUES ($1,'1#逆变器',20,50) RETURNING id`,
+		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio,model,supplier,warranty_until,installed_at)
+		 VALUES ($1,'1#逆变器',20,50,'SN-50KTL','华阳光伏','2031-04-14','2026-04-15') RETURNING id`,
 		b1).Scan(&inv1); err != nil {
 		return err
 	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio) VALUES ($1,'2#逆变器',20,50) RETURNING id`,
+		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio,model,supplier,warranty_until,installed_at)
+		 VALUES ($1,'2#逆变器',20,50,'SN-50KTL','华阳光伏','2031-04-14','2026-04-15') RETURNING id`,
 		b1).Scan(&inv2); err != nil {
 		return err
+	}
+	// 设备绑定组件：按 50/50 装机比例，三户（24/20/12 块）与公共（24 块）各自一半接到两台逆变器
+	bind := func(inv int64, uid any, panels int) {
+		ratio := float64(panels) / 80 * 100
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO panel_bindings(building_id,inverter_id,user_id,panel_count,ratio,created_by)
+			VALUES ($1,$2,$3,$4,$5,$6)`, b1, inv, uid, panels, ratio, property); err != nil {
+			panic(err)
+		}
+	}
+	for _, inv := range []int64{inv1, inv2} {
+		bind(inv, r1, 12) // 张伟 15%
+		bind(inv, r2, 10) // 李娜 12.5%
+		bind(inv, r3, 6)  // 王强 7.5%
+		bind(inv, 0, 12)  // 公共部分 15%
 	}
 	for _, m := range []struct {
 		month  string
@@ -159,6 +178,10 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 		INSERT INTO work_orders(building_id,inverter_id,period_month,title,description,wo_type,responsibility,cost,status,reporter_id,assignee,resolved_at)
 		VALUES ($1,NULL,'2026-09','601 主卧顶板渗水','暴雨后顶板线管周边渗水，排查为支架穿层防水卷材老化','leak','property',600,'resolved',$2,'防水班组-周工',now())`,
 		b1, r1); err != nil {
+		return err
+	}
+	// 2# 逆变器 9 月停机故障：设备质量（保修期内），已测算+曲线复核，赔付尚未入账（留待演示）
+	if err := seedOutageEvent(ctx, tx, b1, property, inv1, inv2, r1, r2, r3); err != nil {
 		return err
 	}
 	// 8 月结算：用结算引擎真实定稿，并同步台账/住户余额/收付款记录
@@ -241,7 +264,130 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
-// seedFinalizeAugust 用结算引擎生成并定稿 2026-08 月度结算，同步写入台账、住户余额与收付款记录。
+// seedOutageEvent 构造 2# 逆变器 9 月停机故障的完整演示数据：
+// 日曲线（故障前/停机/修复后，合计与分表月读数 920kWh 一致）、按引擎测算的损失分摊、
+// 曲线复核（恢复至基线，赔付覆盖真实损失）以及对同型号 1# 逆变器的复查提醒。赔付未入账，留作演示。
+func seedOutageEvent(ctx context.Context, tx pgx.Tx, bid, propertyID, inv1, inv2, r1, r2, r3 int64) error {
+	const gridPrice, subsidyRate = 0.4153, 0.05
+	faultAt := time.Date(2026, 9, 12, 8, 0, 0, 0, time.Local)
+	respondedAt := time.Date(2026, 9, 12, 14, 0, 0, 0, time.Local)
+	resolvedAt := time.Date(2026, 9, 19, 20, 0, 0, 0, time.Local)
+
+	// 曲线：9/1-9/11 正常（1 天 40 + 10 天 41 = 450）；9/12 停机前发 13.3；
+	// 9/13-9/18 为零；9/19 修复后发 6.7；9/20-9/30 恢复（1 天 40 + 10 天 41 = 450）。合计 920。
+	put := func(day string, inv int64, kwh float64, phase string) {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO generation_curve_points(building_id,inverter_id,day,kwh,phase)
+			VALUES ($1,$2,$3,$4,$5)
+			ON CONFLICT (building_id,inverter_id,day) DO UPDATE SET kwh=EXCLUDED.kwh, phase=EXCLUDED.phase`,
+			bid, inv, day, kwh, phase); err != nil {
+			panic(err)
+		}
+	}
+	for d := 1; d <= 11; d++ {
+		kwh := 41.0
+		if d == 1 {
+			kwh = 40
+		}
+		put(fmt.Sprintf("2026-09-%02d", d), inv2, kwh, "normal")
+	}
+	put("2026-09-12", inv2, 13.3, "outage")
+	for d := 13; d <= 18; d++ {
+		put(fmt.Sprintf("2026-09-%02d", d), inv2, 0, "outage")
+	}
+	put("2026-09-19", inv2, 6.7, "recovery")
+	for d := 20; d <= 30; d++ {
+		kwh := 41.0
+		if d == 20 {
+			kwh = 40
+		}
+		put(fmt.Sprintf("2026-09-%02d", d), inv2, kwh, "recovery")
+	}
+
+	bindings := []outage.Binding{
+		{UserID: &r1, Name: "张伟", Ratio: 15, PanelCount: 12},
+		{UserID: &r2, Name: "李娜", Ratio: 12.5, PanelCount: 10},
+		{UserID: &r3, Name: "王强", Ratio: 7.5, PanelCount: 6},
+		{Name: "公共部分", Ratio: 15, PanelCount: 12},
+	}
+	baseline := 450.0 / 11
+	asm := outage.Assess(outage.Input{
+		FaultAt: faultAt, RespondedAt: &respondedAt, ResolvedAt: &resolvedAt,
+		AsOf: resolvedAt, ResponseSLAHours: 24,
+		CauseType: outage.CauseQuality, UnderWarranty: true,
+		BaselineKwhPerDay: baseline, GridPrice: gridPrice, SubsidyRate: subsidyRate,
+		Bindings: bindings,
+	})
+
+	// 复核：基线与修复后各 11 个全天点，平均均为 450/11
+	var basePts, recPts []outage.CurvePoint
+	for d := 1; d <= 11; d++ {
+		kwh := 41.0
+		if d == 1 {
+			kwh = 40
+		}
+		basePts = append(basePts, outage.CurvePoint{Day: time.Date(2026, 9, d, 0, 0, 0, 0, time.UTC), Kwh: kwh})
+	}
+	for i, d := 0, 20; d <= 30; i, d = i+1, d+1 {
+		kwh := 41.0
+		if d == 20 {
+			kwh = 40
+		}
+		recPts = append(recPts, outage.CurvePoint{Day: time.Date(2026, 9, d, 0, 0, 0, 0, time.UTC), Kwh: kwh})
+	}
+	rv := outage.CompareCurve(outage.ReviewInput{
+		BaselinePoints: basePts, RecoveryPoints: recPts,
+		FallbackBaseline: baseline, EventLossAmount: asm.LossAmountTotal,
+		SupplierPaid: asm.SupplierPaidTotal, PropertyPaid: asm.PropertyPaidTotal,
+	}, gridPrice+subsidyRate)
+
+	var eid int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO inverter_outage_events(building_id,inverter_id,title,period_month,
+			fault_at,responded_at,resolved_at,response_sla_hours,cause_type,under_warranty,warranty_note,
+			baseline_kwh_per_day,lost_kwh_total,lost_kwh_quality,lost_kwh_channel,lost_kwh_pending,
+			grid_price,subsidy_per_kwh,loss_amount_total,supplier_paid_amount,property_paid_amount,
+			recovery_baseline_avg,recovery_after_avg,recovery_rate,actual_extra_loss_kwh,
+			cover_status,review_note,status,created_by,reviewed_by,reviewed_at)
+		VALUES ($1,$2,'2#逆变器过热保护停机（散热风扇故障）','2026-09',
+			$3,$4,$5,24,'quality',TRUE,'供应商 华阳光伏；保修至 2031-04-14（故障在保修期内）',
+			$6,$7,$8,$9,$10,$11,$12,$13,$14,0,
+			$15,$16,$17,0,$18,$19,'recovered',$20,$20,now()) RETURNING id`,
+		bid, inv2, faultAt, respondedAt, resolvedAt,
+		baseline, asm.LostKwhTotal, asm.LostKwhQuality, asm.LostKwhChannel, asm.LostKwhPending,
+		gridPrice, subsidyRate, asm.LossAmountTotal, asm.SupplierPaidTotal,
+		rv.BaselineAvg, rv.RecoveryAvg, rv.RecoveryRate, rv.CoverStatus, rv.Note, propertyID).Scan(&eid); err != nil {
+		return err
+	}
+	for _, a := range asm.Allocations {
+		uid := int64(0)
+		if a.UserID != nil {
+			uid = *a.UserID
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO outage_allocations(event_id,user_id,ratio,panel_count,lost_kwh,
+				loss_quality,loss_channel,loss_pending,loss_total,supplier_due,supplier_paid)
+			VALUES ($1,$2,$3,$4,$5,$6,0,0,$7,$8,$9)`,
+			eid, uid, a.Ratio, a.PanelCount, a.LostKwh, a.LossQuality, a.LossTotal,
+			a.SupplierDue, a.SupplierPaid); err != nil {
+			return err
+		}
+	}
+	// 同型号 1# 逆变器复查提醒（质量故障批次复查）
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outage_rechecks(building_id,event_id,inverter_id,reason)
+		VALUES ($1,$2,$3,'同型号（SN-50KTL）2#逆变器散热风扇质量故障并触发保修赔付，请安排批次复查散热模块')`,
+		bid, eid, inv1); err != nil {
+		return err
+	}
+	// 设备已恢复正常
+	if _, err := tx.Exec(ctx,
+		`UPDATE inverters SET status='normal', fault_note='', fault_at=NULL WHERE id=$1`, inv2); err != nil {
+		return err
+	}
+	return nil
+}
+
 func seedFinalizeAugust(ctx context.Context, tx pgx.Tx, bid, propertyID, r1, r2, r3 int64) error {
 	res := settlement.Compute(settlement.Input{
 		BuildingID:  bid,

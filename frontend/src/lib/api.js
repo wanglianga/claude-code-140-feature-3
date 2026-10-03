@@ -58,3 +58,15 @@ export const WO_RESP = {
   owner: '业主',
   insurance: '保险',
 }
+export const CAUSE_LABELS = {
+  pending: '待判定',
+  quality: '设备质量（保修）',
+  channel: '维护通道占用',
+  mixed: '质量+通道延迟',
+}
+export const COVER_LABELS = {
+  pending: '待复核',
+  covered: '赔付覆盖损失',
+  shortfall: '补偿不足',
+  surplus: '赔付有结余',
+}

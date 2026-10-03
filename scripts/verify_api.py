@@ -5,8 +5,10 @@
     python3 scripts/verify_api.py [BASE_URL]
 
 前置：服务已启动且数据库为初始种子状态（SEED_ON_START=true 首次启动后的干净库）。
-脚本会校验：驾驶舱 → 9 月结算（维修基金动用+分摊）→ 定稿入账 → 房屋转让 →
-次月分成归属切换 → 公告/异议/异常解释/年报 → 阶段回退原因强制。
+脚本会校验：驾驶舱 → 9 月结算（维修基金动用+分摊）→ 定稿入账 →
+逆变器停机影响分摊（设备质量保修赔付到户+公共账、入账锁定、同型号复查）→
+房屋转让（绑定组件随权益过户）→ 次月分成归属切换 → 10 月质量+通道占用混合责任事件 →
+公告/异议/异常解释/年报 → 阶段回退原因强制。
 任一断言失败立即退出（exit 1）。
 """
 import json
@@ -94,6 +96,48 @@ def main():
     check("9月后公共账户=85920.78", approx(lg["public_balance"], 85920.78), str(lg["public_balance"]))
     check("9月后维修基金=23.26", approx(lg["maintenance_fund_balance"], 23.26), str(lg["maintenance_fund_balance"]))
 
+    # C2. 逆变器停机故障影响分摊（种子事件：2# 9 月质量故障，已测算+曲线复核，未入账）
+    st, ivs = call("GET", f"/api/buildings/{bid}/inverters", prop)
+    inv2_id = next(i["id"] for i in ivs["items"] if i["name"].startswith("2#"))
+    inv1_id = next(i["id"] for i in ivs["items"] if i["name"].startswith("1#"))
+    check("设备型号/保修已登记", next(i for i in ivs["items"] if i["id"] == inv2_id)["warranty_until"] == "2031-04-14")
+    st, bds = call("GET", f"/api/buildings/{bid}/panel-bindings", prop)
+    check("组件绑定共8行（2台×4归属）", len(bds["items"]) == 8, str(len(bds["items"])))
+    st, ous = call("GET", f"/api/buildings/{bid}/outages", prop)
+    check("停机事件1条", len(ous["items"]) == 1 and ous["items"][0]["cause_type"] == "quality", str(ous))
+    oid = ous["items"][0]["id"]
+    st, od = call("GET", f"/api/outages/{oid}", prop)
+    check("损失电量306.82", approx(od["lost_kwh_total"], 306.82), str(od["lost_kwh_total"]))
+    check("损失金额142.76", approx(od["loss_amount_total"], 142.76), str(od["loss_amount_total"]))
+    check("曲线复核已覆盖/恢复率100%",
+          od["cover_status"] == "covered" and approx(od["recovery_rate"], 100), str((od["cover_status"], od["recovery_rate"])))
+    z_alloc = next(a for a in od["allocations"] if a["name"].startswith("张伟"))
+    check("张伟应赔42.83", approx(z_alloc["supplier_due"], 42.83) and approx(z_alloc["supplier_paid"], 42.83), str(z_alloc))
+    # 同型号复查提醒已生成 1 条
+    st, rcs = call("GET", f"/api/buildings/{bid}/rechecks", prop)
+    check("同型号复查提醒1条（1#）", len(rcs["items"]) == 1 and rcs["items"][0]["inverter_id"] == inv1_id, str(rcs))
+    # 住户无权登记赔付入账
+    st, _ = call("POST", f"/api/outages/{oid}/post-compensation", zhang)
+    check("住户入账被拒(403)", st == 403, str(st))
+    # 赔付入账：张伟 +42.83、李娜 +35.69、王强 +21.41；公共份额 42.83 留存公共账
+    st, _ = call("POST", f"/api/outages/{oid}/post-compensation", prop)
+    check("供应商质量赔付入账", st == 200, str(st))
+    st, me = call("GET", "/api/me", zhang)
+    check("张伟余额=605.59+42.83=648.42", approx(me["balance"], 648.42), str(me["balance"]))
+    st, lg = call("GET", f"/api/buildings/{bid}/ledger", prop)
+    # 85920.78 + 公共留存42.83 - 住户转出(42.83+35.69+21.41=99.93) = 85863.68
+    check("入账后公共账户=85863.68", approx(lg["public_balance"], 85863.68), str(lg["public_balance"]))
+    st, _ = call("POST", f"/api/outages/{oid}/post-compensation", prop)
+    check("赔付不可重复入账(409)", st == 409, str(st))
+    st, _ = call("POST", f"/api/outages/{oid}/assess", prop, {"cause_type": "quality"})
+    check("入账后禁止重新测算(409)", st == 409, str(st))
+    # 复查闭环
+    rcid = rcs["items"][0]["id"]
+    st, _ = call("POST", f"/api/rechecks/{rcid}", prop, {"status": "done", "result": "散热模块批次复查正常"})
+    check("同型号复查完成", st == 200, str(st))
+    st, rcs2 = call("GET", f"/api/buildings/{bid}/rechecks?status=open", prop)
+    check("无待处理复查", len(rcs2["items"]) == 0, str(len(rcs2["items"])))
+
     # D. 房屋转让：张伟 -> 刘洋
     st, subs = call("GET", f"/api/buildings/{bid}/subscriptions", prop)
     sid = next(x["id"] for x in subs["items"] if x["name"].startswith("张伟") and x["type"] == "shareholder")
@@ -127,7 +171,37 @@ def main():
     st, me = call("GET", "/api/me", liu)
     check("刘洋余额=335.02", approx(me["balance"], 335.02), str(me["balance"]))
     st, me = call("GET", "/api/me", zhang)
-    check("张伟余额保持605.59（历史收益不转移）", approx(me["balance"], 605.59), str(me["balance"]))
+    check("张伟余额保持648.42（历史收益与停机赔付不转移）", approx(me["balance"], 648.42), str(me["balance"]))
+
+    # E2. 10 月 1# 混合责任事件：设备质量 + 物业维护通道占用致维修超 SLA
+    st, oe = call("POST", f"/api/buildings/{bid}/outages", prop, {
+        "inverter_id": inv1_id, "title": "1#过热停机（通道占用延迟）", "period_month": "2026-10",
+        "fault_at": "2026-10-15 08:00", "responded_at": "2026-10-16 20:00",
+        "resolved_at": "2026-10-18 20:00", "response_sla_hours": 24,
+    })
+    check("登记10月停机事件", st == 201, str(st))
+    eid2 = oe["id"]
+    st, ae = call("POST", f"/api/outages/{eid2}/assess", prop, {
+        "cause_type": "mixed",
+        "channel_blocked_at": "2026-10-16 08:00", "channel_freed_at": "2026-10-18 20:00",
+        "baseline_kwh_per_day": 50, "grid_price": 0.4153, "subsidy_per_kwh": 0.05,
+    })
+    check("混合责任测算", st == 200, str(st))
+    a = ae["assessment"]
+    check("质量段50kWh/通道段125kWh", approx(a["lost_kwh_quality"], 50) and approx(a["lost_kwh_channel"], 125),
+          f'{a["lost_kwh_quality"]}/{a["lost_kwh_channel"]}')
+    check("超SLA 12小时", approx(a["sla_delay_hours"], 12), str(a["sla_delay_hours"]))
+    liu_alloc = next(x for x in ae["allocations"] if x["user_id"] == liu_id)
+    liu_add = float(liu_alloc["supplier_paid"]) + float(liu_alloc["property_paid"])
+    check("刘洋绑定份额30%含供应商+物业两笔赔付", liu_add > 0, str(liu_alloc))
+    st, _ = call("POST", f"/api/outages/{eid2}/post-compensation", prop)
+    check("混合责任赔付入账", st == 200, str(st))
+    st, me = call("GET", "/api/me", liu)
+    check("刘洋余额=335.02+停机赔付", approx(me["balance"], 335.02 + liu_add), f'{me["balance"]} vs {335.02 + liu_add}')
+    st, lg = call("GET", f"/api/buildings/{bid}/ledger", prop)
+    prop_notes = [x["memo"] for x in lg["items"] if "物业" in x["memo"] and "停机" in x["memo"]]
+    check("公共账含物业责任说明", any("维护通道占用" in m for m in prop_notes), str(prop_notes[:2]))
+
 
     # F. 公告 / 异议 / 异常解释 / 年报
     st, _ = call("POST", f"/api/buildings/{bid}/announcements", prop,

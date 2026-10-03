@@ -184,6 +184,23 @@ func (s *Server) confirmTransfer(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
+		// 设备绑定组件随认购权益一并过户给新业主（同逆变器下已有记录则合并）
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO panel_bindings(building_id,inverter_id,user_id,panel_count,ratio)
+			SELECT building_id,inverter_id,$2,panel_count,ratio FROM panel_bindings
+			WHERE building_id=$1 AND user_id=$3
+			ON CONFLICT (inverter_id,user_id)
+			DO UPDATE SET panel_count=panel_bindings.panel_count+EXCLUDED.panel_count,
+			              ratio=panel_bindings.ratio+EXCLUDED.ratio`,
+			*bid, *toID, *fromID); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if _, err := tx.Exec(r.Context(),
+			`DELETE FROM panel_bindings WHERE building_id=$1 AND user_id=$2`, *bid, *fromID); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 		if _, err := tx.Exec(r.Context(),
 			`INSERT INTO building_members(building_id,user_id,member_type) VALUES ($1,$2,'resident') ON CONFLICT DO NOTHING`,
 			*bid, *toID); err != nil {
@@ -198,7 +215,23 @@ func (s *Server) confirmTransfer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// 退购：退款给原业主
+		// 退购：退款给原业主，认购份额与设备绑定组件回到公共部分（user_id=0）
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO panel_bindings(building_id,inverter_id,user_id,panel_count,ratio)
+			SELECT building_id,inverter_id,0,panel_count,ratio FROM panel_bindings
+			WHERE building_id=$1 AND user_id=$2
+			ON CONFLICT (inverter_id,user_id)
+			DO UPDATE SET panel_count=panel_bindings.panel_count+EXCLUDED.panel_count,
+			              ratio=panel_bindings.ratio+EXCLUDED.ratio`,
+			*bid, *fromID); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if _, err := tx.Exec(r.Context(),
+			`DELETE FROM panel_bindings WHERE building_id=$1 AND user_id=$2`, *bid, *fromID); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 		if _, err := tx.Exec(r.Context(),
 			`UPDATE subscriptions SET status='refunded' WHERE id=$1`, *sid); err != nil {
 			writeErr(w, 500, err.Error())
