@@ -328,6 +328,42 @@ func (s *Server) createAnnualReport(w http.ResponseWriter, r *http.Request) {
 	}
 	summary["work_orders"] = wos
 
+	// 年度逆变器故障赔付记录（供应商质量赔付 / 物业通道延迟赔偿）
+	fltRows, err := s.Pool.Query(r.Context(), `
+		SELECT f.period_month, COALESCE(i.name,''), f.cause,
+			f.lost_kwh, f.supplier_compensation, f.property_compensation,
+			f.recovery_ratio, f.cover_ratio, f.paid
+		FROM inverter_faults f LEFT JOIN inverters i ON i.id=f.inverter_id
+		WHERE f.building_id=$1 AND f.period_month LIKE $2 AND f.assessed=TRUE
+		ORDER BY f.period_month`,
+		bid, prefix+"%")
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer fltRows.Close()
+	faults := []any{}
+	var faultSup, faultProp float64
+	for fltRows.Next() {
+		var month, inv, cause string
+		var lostKwh, sup, prop, recovery, cover float64
+		var paid bool
+		if err := fltRows.Scan(&month, &inv, &cause, &lostKwh, &sup, &prop, &recovery, &cover, &paid); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		faultSup += sup
+		faultProp += prop
+		faults = append(faults, map[string]any{
+			"period_month": month, "inverter": inv, "cause": cause,
+			"lost_kwh": lostKwh, "supplier_compensation": sup, "property_compensation": prop,
+			"recovery_ratio": recovery, "cover_ratio": cover, "paid": paid,
+		})
+	}
+	summary["inverter_faults"] = faults
+	summary["fault_supplier_compensation"] = faultSup
+	summary["fault_property_compensation"] = faultProp
+
 	var rid int
 	err = s.Pool.QueryRow(r.Context(), `
 		INSERT INTO annual_reports(building_id,year,summary,created_by)

@@ -558,6 +558,18 @@ func (s *Server) buildingDashboard(w http.ResponseWriter, r *http.Request) {
 		`SELECT count(*) FILTER (WHERE status<>'resolved'), count(*) FILTER (WHERE status='resolved')
 		 FROM work_orders WHERE building_id=$1`, bid).Scan(&woOpen, &woResolved)
 
+	// 逆变器故障分摊：待处理故障数、已评估损失、已发放赔付（供应商质量赔付 + 物业通道赔偿）
+	var faultOpen, faultUnpaid, faultReviewed int
+	var faultLoss, faultPaidComp float64
+	_ = s.Pool.QueryRow(r.Context(), `
+		SELECT count(*) FILTER (WHERE status<>'resolved'),
+			count(*) FILTER (WHERE assessed AND NOT paid),
+			count(*) FILTER (WHERE review_needed AND NOT review_done),
+			COALESCE(SUM(total_loss) FILTER (WHERE assessed),0),
+			COALESCE(SUM(supplier_compensation + property_compensation) FILTER (WHERE paid),0)
+		FROM inverter_faults WHERE building_id=$1`,
+		bid).Scan(&faultOpen, &faultUnpaid, &faultReviewed, &faultLoss, &faultPaidComp)
+
 	rows, err := s.Pool.Query(r.Context(), `
 		SELECT period_month, total_kwh, gross_revenue, total_subsidy, distributable, status
 		FROM settlement_periods WHERE building_id=$1 ORDER BY period_month`, bid)
@@ -594,6 +606,11 @@ func (s *Server) buildingDashboard(w http.ResponseWriter, r *http.Request) {
 	d["resident_count"] = residentCount
 	d["work_orders_open"] = woOpen
 	d["work_orders_resolved"] = woResolved
+	d["faults_open"] = faultOpen
+	d["fault_compensation_pending"] = faultUnpaid
+	d["same_model_review_pending"] = faultReviewed
+	d["fault_total_loss"] = faultLoss
+	d["fault_paid_compensation"] = faultPaidComp
 	d["monthly_series"] = series
 	writeJSON(w, 200, d)
 }

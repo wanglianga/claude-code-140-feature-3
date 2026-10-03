@@ -67,11 +67,23 @@ func (s *Server) Router() http.Handler {
 		r.Post("/buildings/{id}/inverters", s.createInverter)
 		r.Post("/inverters/{iid}/fault", s.faultInverter)
 		r.Post("/inverters/{iid}/resolve", s.resolveInverter)
+		r.Patch("/inverters/{iid}", s.updateInverterProfile)
 		r.Get("/buildings/{id}/generation", s.listGeneration)
 		r.Post("/buildings/{id}/generation", s.uploadGeneration)
 		r.Get("/buildings/{id}/alerts", s.listAlerts)
 		r.Post("/buildings/{id}/alerts", s.createAlert)
 		r.Post("/alerts/{aid}/explain", s.explainAlert)
+
+		// 逆变器故障影响分摊
+		r.Get("/buildings/{id}/faults", s.listFaults)
+		r.Post("/buildings/{id}/faults", s.createFault)
+		r.Get("/faults/{fid}", s.getFault)
+		r.Post("/faults/{fid}/respond", s.respondFault)
+		r.Post("/faults/{fid}/resolve", s.resolveFault)
+		r.Post("/faults/{fid}/assess", s.assessFault)
+		r.Post("/faults/{fid}/compare-curve", s.compareFaultCurve)
+		r.Post("/faults/{fid}/pay", s.payFaultCompensation)
+		r.Post("/faults/{fid}/review", s.reviewSameModel)
 
 		// 维修工单
 		r.Get("/buildings/{id}/work-orders", s.listWorkOrders)

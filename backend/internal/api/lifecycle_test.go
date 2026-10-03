@@ -308,6 +308,143 @@ func TestFullLifecycle(t *testing.T) {
 		t.Fatalf("维修基金=%v want 9.6", out["maintenance_fund_balance"])
 	}
 
+	// ===== 逆变器故障影响分摊 =====
+	// 两台设备登记同型号档案（保修期 60 个月，2026-04 安装）
+	for _, inv := range []int64{inv1, inv2} {
+		if st, out := c.do("PATCH", fmt.Sprintf("/api/inverters/%d", inv), admin, map[string]any{
+			"model": "SUN15K", "supplier": "晶能电气",
+			"warranty_months": 60, "install_date": "2026-04-01",
+		}); st != 200 {
+			t.Fatalf("设备档案更新: %d %v", st, out)
+		}
+	}
+	// inv2 质量故障：10/8 8:00 停机，4 小时到场（24h SLA 内），10/9 8:00 修复（停机 24h）
+	st, out = c.do("POST", fmt.Sprintf("/api/buildings/%d/faults", bid), tA, map[string]any{
+		"inverter_id": inv2, "period_month": "2026-10",
+		"title": "逆变模块过热停机", "baseline_daily_kwh": 60,
+		"grid_price": 0.4, "subsidy_per_kwh": 0.05,
+		"fault_at": "2026-10-08T08:00:00+08:00",
+	})
+	if st != 201 {
+		t.Fatalf("登记故障: %d %v", st, out)
+	}
+	faultID := int64(out["id"].(float64))
+	// 未修复先评估应 409
+	if st, _ = c.do("POST", fmt.Sprintf("/api/faults/%d/assess", faultID), admin,
+		map[string]any{"cause": "quality"}); st != 409 {
+		t.Fatalf("未修复评估应 409, got %d", st)
+	}
+	if st, _ = c.do("POST", fmt.Sprintf("/api/faults/%d/respond", faultID), admin,
+		map[string]any{"responded_at": "2026-10-08T12:00:00+08:00"}); st != 200 {
+		t.Fatalf("运维响应: %d", st)
+	}
+	if st, out = c.do("POST", fmt.Sprintf("/api/faults/%d/resolve", faultID), admin,
+		map[string]any{"resolved_at": "2026-10-09T08:00:00+08:00"}); st != 200 {
+		t.Fatalf("修复: %d %v", st, out)
+	}
+	if out["sla_met"] != true || out["downtime_hours"].(float64) != 24 || out["response_hours"].(float64) != 4 {
+		t.Fatalf("停机/响应时长或 SLA 错误: %v", out)
+	}
+	// 住户无权评估责任（403）
+	if st, _ = c.do("POST", fmt.Sprintf("/api/faults/%d/assess", faultID), tA,
+		map[string]any{"cause": "quality"}); st != 403 {
+		t.Fatalf("住户评估责任应 403, got %d", st)
+	}
+	// 责任与保修评估（保修按设备档案自动认定）
+	st, out = c.do("POST", fmt.Sprintf("/api/faults/%d/assess", faultID), admin,
+		map[string]any{"cause": "quality"})
+	if st != 200 {
+		t.Fatalf("质量责任评估: %d %v", st, out)
+	}
+	if out["warranty_covered"] != true || out["lost_kwh"].(float64) != 60 {
+		t.Fatalf("保修认定/损失电量错误: %v", out)
+	}
+	if out["supplier_compensation"].(float64) != 27 || out["property_compensation"].(float64) != 0 {
+		t.Fatalf("供应商应赔 27 元（60×0.45）: %v", out)
+	}
+	if out["review_needed"] != true {
+		t.Fatalf("质量赔付应触发同型号复查提醒")
+	}
+	// 住户赔付明细：甲 40%=10.80、乙 30%=8.10，公共 30%=8.10（合计 27.00）
+	itemAmt := map[int64]float64{}
+	var pubSup float64
+	for _, it := range out["items"].([]any) {
+		m := it.(map[string]any)
+		if m["party"] == "public" {
+			pubSup = m["supplier_amount"].(float64)
+		} else {
+			itemAmt[int64(m["user_id"].(float64))] = m["supplier_amount"].(float64)
+		}
+	}
+	if itemAmt[idA] != 10.8 || itemAmt[idB] != 8.1 || pubSup != 8.1 {
+		t.Fatalf("住户/公共赔付明细错误: %v pub=%v", itemAmt, pubSup)
+	}
+	// 未对比曲线先发放 → 409；出力未恢复（恢复率<95%）→ 仍 409
+	if st, _ = c.do("POST", fmt.Sprintf("/api/faults/%d/pay", faultID), admin, nil); st != 409 {
+		t.Fatalf("未对比曲线发放应 409, got %d", st)
+	}
+	if st, out = c.do("POST", fmt.Sprintf("/api/faults/%d/compare-curve", faultID), admin,
+		map[string]any{"post_daily_kwh": 50}); st != 200 || out["compare_status"] != "insufficient" {
+		t.Fatalf("恢复率 83%% 应 insufficient: %d %v", st, out)
+	}
+	if st, _ = c.do("POST", fmt.Sprintf("/api/faults/%d/pay", faultID), admin, nil); st != 409 {
+		t.Fatalf("补偿不足时发放应 409, got %d", st)
+	}
+	// 复测恢复后对比通过并发放
+	if st, out = c.do("POST", fmt.Sprintf("/api/faults/%d/compare-curve", faultID), admin,
+		map[string]any{"post_daily_kwh": 59}); st != 200 || out["compare_status"] != "covered" {
+		t.Fatalf("恢复率 98.33%% 应 covered: %d %v", st, out)
+	}
+	if st, _ = c.do("POST", fmt.Sprintf("/api/faults/%d/pay", faultID), admin, nil); st != 200 {
+		t.Fatalf("发放供应商赔付: %d", st)
+	}
+	// 甲余额 64 + 10.80 = 74.80
+	st, out = c.do("GET", "/api/me", tA, nil)
+	if out["balance"].(string) != "74.80" {
+		t.Fatalf("甲余额含质量赔付=%v want 74.80", out["balance"])
+	}
+	if st, _ = c.do("POST", fmt.Sprintf("/api/faults/%d/pay", faultID), admin, nil); st != 409 {
+		t.Fatalf("重复发放应 409, got %d", st)
+	}
+	// 同型号复查：通道类故障无需复查（409）；质量故障复查成功
+	if st, _ = c.do("POST", fmt.Sprintf("/api/faults/%d/review", faultID), admin,
+		map[string]any{"note": "巡检同型号设备正常"}); st != 200 {
+		t.Fatalf("同型号复查登记: %d", st)
+	}
+
+	// inv1 通道占用责任故障：物业赔偿入公共账后代发住户
+	st, out = c.do("POST", fmt.Sprintf("/api/buildings/%d/faults", bid), tA, map[string]any{
+		"inverter_id": inv1, "period_month": "2026-10",
+		"title": "屋顶通道被杂物占用无法进场", "baseline_daily_kwh": 60,
+		"grid_price": 0.4, "subsidy_per_kwh": 0.05,
+		"fault_at": "2026-10-15T08:00:00+08:00",
+	})
+	chFault := int64(out["id"].(float64))
+	c.do("POST", fmt.Sprintf("/api/faults/%d/respond", chFault), admin, nil)
+	c.do("POST", fmt.Sprintf("/api/faults/%d/resolve", chFault), admin,
+		map[string]any{"resolved_at": "2026-10-16T08:00:00+08:00"})
+	st, out = c.do("POST", fmt.Sprintf("/api/faults/%d/assess", chFault), admin,
+		map[string]any{"cause": "channel"})
+	if st != 200 || out["supplier_compensation"].(float64) != 0 || out["property_compensation"].(float64) != 27 {
+		t.Fatalf("通道责任物业应赔 27 元: %d %v", st, out)
+	}
+	if out["review_needed"] != false {
+		t.Fatalf("通道故障 review_needed 应为 false, got %v", out["review_needed"])
+	}
+	c.do("POST", fmt.Sprintf("/api/faults/%d/compare-curve", chFault), admin,
+		map[string]any{"post_daily_kwh": 60})
+	if st, _ = c.do("POST", fmt.Sprintf("/api/faults/%d/review", chFault), admin, nil); st != 409 {
+		t.Fatalf("通道故障无需复查, /review 应 409, got %d", st)
+	}
+	if st, _ = c.do("POST", fmt.Sprintf("/api/faults/%d/pay", chFault), admin, nil); st != 200 {
+		t.Fatalf("发放物业赔偿: %d", st)
+	}
+	// 乙余额 = 9月分成48 + 质量赔付8.10 + 通道赔付8.10 = 64.20
+	st, out = c.do("GET", "/api/me", tB, nil)
+	if out["balance"].(string) != "64.20" {
+		t.Fatalf("乙余额=%v want 64.20", out["balance"])
+	}
+
 	// 房屋转让：甲把认购权益随房转给丙
 	var subA int64
 	st, out = c.do("GET", fmt.Sprintf("/api/buildings/%d/subscriptions", bid), admin, nil)

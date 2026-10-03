@@ -6,7 +6,7 @@ const CAT_LABEL = {
   subscription: '认购款', revenue: '发电收入', subsidy: '发电补贴',
   public: '公共收益', maintenance_fund: '维修基金', repair: '维修支出',
   om: '运维费', tax: '税费', refund: '退款', compensation: '责任赔偿',
-  transfer_in: '权益转入',
+  transfer_in: '权益转入', fault_comp: '故障赔付',
 }
 
 export default function LedgerTab({ user, building }) {

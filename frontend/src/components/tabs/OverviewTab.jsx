@@ -61,6 +61,21 @@ export default function OverviewTab({ user, building, dash, reload }) {
         </div>
       </div>
 
+      <div className="muted-box">
+        <b>逆变器故障影响分摊：</b>
+        {(dash?.faults_open || 0) > 0
+          ? <span className="badge red" style={{ marginRight: 6 }}>{dash.faults_open} 台停机中</span>
+          : <span className="badge green" style={{ marginRight: 6 }}>设备运行正常</span>}
+        {(dash?.fault_compensation_pending || 0) > 0 &&
+          <span className="badge amber" style={{ marginRight: 6 }}>{dash.fault_compensation_pending} 笔补偿待发放</span>}
+        {(dash?.same_model_review_pending || 0) > 0 &&
+          <span className="badge amber" style={{ marginRight: 6 }}>{dash.same_model_review_pending} 台同型号待复查</span>}
+        <span className="small muted">
+          已认定故障收益损失 ¥{fmtMoney(dash?.fault_total_loss)} · 已发放赔付 ¥{fmtMoney(dash?.fault_paid_compensation)}
+          （设备质量由供应商赔付住户；通道占用延迟由物业赔偿入楼栋公共账）
+        </span>
+      </div>
+
       <div className="card">
         <div className="card-title"><h2>月度收益走势（定稿月份）</h2></div>
         <RevenueChart series={dash?.monthly_series || []} />

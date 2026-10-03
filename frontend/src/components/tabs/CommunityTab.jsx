@@ -211,6 +211,34 @@ function AnnualSummary({ s }) {
           ))}
         </tbody>
       </table>
+      <h4 style={{ margin: '12px 0 6px' }}>逆变器故障收益损失与赔付</h4>
+      <table>
+        <thead><tr><th>月份</th><th>设备</th><th>责任</th><th className="num">损失电量</th>
+          <th className="num">供应商赔付</th><th className="num">物业赔偿</th>
+          <th className="num">恢复率/覆盖率</th><th>状态</th></tr></thead>
+        <tbody>
+          {(s.inverter_faults || []).map((f, i) => (
+            <tr key={i}>
+              <td>{f.period_month}</td><td>{f.inverter}</td>
+              <td>{f.cause === 'quality' ? '设备质量' : f.cause === 'channel' ? '通道占用' : '混合责任'}</td>
+              <td className="num">{fmtNum(f.lost_kwh)} kWh</td>
+              <td className="num">¥{fmtMoney(f.supplier_compensation)}</td>
+              <td className="num">¥{fmtMoney(f.property_compensation)}</td>
+              <td className="num small">{Number(f.recovery_ratio).toFixed(1)}% / {Number(f.cover_ratio).toFixed(1)}%</td>
+              <td>{f.paid ? <span className="badge green">已补偿</span> : <span className="badge amber">待发放</span>}</td>
+            </tr>
+          ))}
+          {(s.inverter_faults || []).length === 0 && (
+            <tr><td colSpan={8} className="list-empty">本年度无已评估故障</td></tr>
+          )}
+        </tbody>
+      </table>
+      {(Number(s.fault_supplier_compensation) || Number(s.fault_property_compensation)) ? (
+        <p className="small muted" style={{ marginTop: 6 }}>
+          合计：供应商质量赔付 ¥{fmtMoney(s.fault_supplier_compensation)}（进入住户收益补偿）；
+          物业通道延迟赔偿 ¥{fmtMoney(s.fault_property_compensation)}（楼栋公共账说明后代发住户）。
+        </p>
+      ) : null}
     </div>
   )
 }

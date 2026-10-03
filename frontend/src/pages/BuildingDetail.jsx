@@ -5,6 +5,7 @@ import OverviewTab from '../components/tabs/OverviewTab'
 import VoteTab from '../components/tabs/VoteTab'
 import SubscriptionTab from '../components/tabs/SubscriptionTab'
 import GenerationTab from '../components/tabs/GenerationTab'
+import FaultTab from '../components/tabs/FaultTab'
 import WorkOrderTab from '../components/tabs/WorkOrderTab'
 import SettlementTab from '../components/tabs/SettlementTab'
 import LedgerTab from '../components/tabs/LedgerTab'
@@ -16,6 +17,7 @@ const TABS = [
   { key: 'vote', label: '楼栋表决' },
   { key: 'subscription', label: '认购缴费' },
   { key: 'generation', label: '发电计量' },
+  { key: 'fault', label: '故障分摊' },
   { key: 'workorder', label: '维修工单' },
   { key: 'settlement', label: '月度结算' },
   { key: 'ledger', label: '账目台账' },
@@ -81,6 +83,7 @@ export default function BuildingDetail({ user, id }) {
       {tab === 'vote' && <VoteTab user={user} building={building} reload={load} />}
       {tab === 'subscription' && <SubscriptionTab user={user} building={building} reload={load} />}
       {tab === 'generation' && <GenerationTab user={user} building={building} />}
+      {tab === 'fault' && <FaultTab user={user} building={building} />}
       {tab === 'workorder' && <WorkOrderTab user={user} building={building} />}
       {tab === 'settlement' && <SettlementTab user={user} building={building} />}
       {tab === 'ledger' && <LedgerTab user={user} building={building} />}

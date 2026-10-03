@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"pvplatform/internal/auth"
+	"pvplatform/internal/fault"
 	"pvplatform/internal/settlement"
 )
 
@@ -120,15 +121,17 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 
-	// 两台逆变器
+	// 两台逆变器（同型号、同供应商，保修期 60 个月——用于同型号设备复查提醒演示）
 	var inv1, inv2 int64
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio) VALUES ($1,'1#逆变器',20,50) RETURNING id`,
+		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio,model,supplier,warranty_months,install_date)
+		 VALUES ($1,'1#逆变器',20,50,'SUN20K-M2','晶能电气',60,DATE '2026-04-01') RETURNING id`,
 		b1).Scan(&inv1); err != nil {
 		return err
 	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio) VALUES ($1,'2#逆变器',20,50) RETURNING id`,
+		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio,model,supplier,warranty_months,install_date)
+		 VALUES ($1,'2#逆变器',20,50,'SUN20K-M2','晶能电气',60,DATE '2026-04-01') RETURNING id`,
 		b1).Scan(&inv2); err != nil {
 		return err
 	}
@@ -163,6 +166,11 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	// 8 月结算：用结算引擎真实定稿，并同步台账/住户余额/收付款记录
 	if err := seedFinalizeAugust(ctx, tx, b1, property, r1, r2, r3); err != nil {
+		return err
+	}
+
+	// 9 月 2# 逆变器质量故障：已修复、已评估保修责任、已做曲线对比，供应商赔付待发放
+	if err := seedFaultSeptember(ctx, tx, b1, inv1, inv2, property, r1, r2, r3); err != nil {
 		return err
 	}
 
@@ -241,7 +249,77 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
-// seedFinalizeAugust 用结算引擎生成并定稿 2026-08 月度结算，同步写入台账、住户余额与收付款记录。
+// seedFaultSeptember 构造 9 月 2# 逆变器保修期内质量故障的完整案例：
+// 9/12 逆变模块过热停机（运维 6 小时到场，满足 24h SLA），9/19 修复恢复；
+// 已按故障引擎评估住户/公共损失与供应商赔付，已完成修复前后曲线对比（covered），
+// 同型号 1# 逆变器待复查，供应商赔付尚未发放（演示发放入账链路）。
+func seedFaultSeptember(ctx context.Context, tx pgx.Tx, bid, inv1, inv2, propertyID, r1, r2, r3 int64) error {
+	res := fault.Assess(fault.Input{
+		InverterID:       inv2,
+		InverterName:     "2#逆变器",
+		InverterRatio:    50,
+		PeriodMonth:      "2026-09",
+		DowntimeHours:    168, // 9/12 08:00 → 9/19 08:00
+		ResponseHours:    6,
+		SLAHours:         24,
+		Cause:            "quality",
+		BaselineDailyKwh: 70,
+		GridPrice:        0.4153,
+		SubsidyRate:      0.05,
+		WarrantyCovered:  true,
+		Shareholders: []fault.Share{
+			{UserID: r1, Name: "张伟", Ratio: 30},
+			{UserID: r2, Name: "李娜", Ratio: 25},
+			{UserID: r3, Name: "王强", Ratio: 15},
+		},
+	})
+	curve := fault.CompareCurve(70, 68, res.TotalLoss, res.SupplierCompensation+res.PropertyCompensation)
+	var fid int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO inverter_faults(building_id,inverter_id,period_month,title,description,status,
+			fault_at,responded_at,resolved_at,downtime_hours,response_hours,sla_response_hours,sla_met,
+			cause,delay_hours,quality_hours,
+			baseline_daily_kwh,grid_price,subsidy_per_kwh,
+			lost_kwh,quality_lost_kwh,channel_lost_kwh,total_loss,
+			warranty_covered,warranty_note,quality_coverage_pct,
+			supplier_compensation,property_compensation,assessed,assessed_at,assessed_by,
+			compare_status,pre_daily_kwh,post_daily_kwh,recovery_ratio,cover_ratio,compare_note,compared_at,
+			paid,review_needed,same_model_ids,review_done,created_by)
+		VALUES ($1,$2,'2026-09','2#逆变器逆变模块过热保护停机','9月12日巡检发现 2# 逆变器逆变模块过热保护停机，
+			厂家判定为 IGBT 模块批次质量缺陷，免费更换后于 9月19日恢复发电','resolved',
+			TIMESTAMPTZ '2026-09-12 08:00:00+08',TIMESTAMPTZ '2026-09-12 14:00:00+08',TIMESTAMPTZ '2026-09-19 08:00:00+08',
+			$3,$4,24,TRUE,
+			'quality',0,$5,
+			70,0.4153,0.05,
+			$6,$7,0,$8,
+			TRUE,'整机保修期 60 个月（2026-04 安装），质量缺陷由供应商晶能电气按发电量损失全额赔付',$9,
+			$10,0,TRUE,now(),$11,
+			$12,70,$13,$14,$15,$16,now(),
+			FALSE,TRUE,$17::bigint[],FALSE,$11)
+		RETURNING id`,
+		bid, inv2,
+		res.DowntimeHours, res.ResponseHours, res.QualityHours,
+		res.LostKwh, res.QualityLostKwh, res.TotalLoss,
+		res.QualityCoveragePct, res.SupplierCompensation, propertyID,
+		curve.Status, curve.PostDailyKwh, curve.RecoveryRatio, curve.CoverRatio, curve.Note,
+		fmt.Sprintf("{%d}", inv1)).Scan(&fid); err != nil {
+		return err
+	}
+	for _, it := range res.Items {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO fault_compensation_items(fault_id,user_id,party,ratio,lost_kwh,supplier_amount,property_amount)
+			VALUES ($1,$2,$3,$4,$5,$6,0)`,
+			fid, it.UserID, it.Party, it.Ratio, it.LostKwh, it.SupplierAmount); err != nil {
+			return err
+		}
+	}
+	// 同步把 2# 逆变器恢复为正常（与 resolved 状态一致）
+	if _, err := tx.Exec(ctx,
+		`UPDATE inverters SET status='normal', fault_note='', fault_at=NULL WHERE id=$1`, inv2); err != nil {
+		return err
+	}
+	return nil
+}
 func seedFinalizeAugust(ctx context.Context, tx pgx.Tx, bid, propertyID, r1, r2, r3 int64) error {
 	res := settlement.Compute(settlement.Input{
 		BuildingID:  bid,

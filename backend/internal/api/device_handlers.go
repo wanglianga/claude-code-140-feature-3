@@ -2,6 +2,9 @@ package api
 
 import (
 	"net/http"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"pvplatform/internal/auth"
 )
@@ -15,9 +18,13 @@ func (s *Server) createInverter(w http.ResponseWriter, r *http.Request) {
 	}
 	bid := urlID(r, "id")
 	var in struct {
-		Name          string  `json:"name"`
-		CapacityKw    float64 `json:"capacity_kw"`
-		CapacityRatio float64 `json:"capacity_ratio"`
+		Name           string  `json:"name"`
+		CapacityKw     float64 `json:"capacity_kw"`
+		CapacityRatio  float64 `json:"capacity_ratio"`
+		Model          string  `json:"model"`
+		Supplier       string  `json:"supplier"`
+		WarrantyMonths int     `json:"warranty_months"`
+		InstallDate    string  `json:"install_date"` // YYYY-MM-DD
 	}
 	if err := decodeJSON(r, &in); err != nil || in.Name == "" {
 		writeErr(w, 400, "逆变器名称必填")
@@ -30,10 +37,20 @@ func (s *Server) createInverter(w http.ResponseWriter, r *http.Request) {
 			in.CapacityRatio = in.CapacityKw / total * 100
 		}
 	}
+	var installDate any
+	if in.InstallDate != "" {
+		if t, err := time.Parse("2006-01-02", in.InstallDate); err == nil {
+			installDate = t
+		} else {
+			writeErr(w, 400, "install_date 格式须为 YYYY-MM-DD")
+			return
+		}
+	}
 	var id int64
 	err := s.Pool.QueryRow(r.Context(),
-		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio) VALUES ($1,$2,$3,$4) RETURNING id`,
-		bid, in.Name, in.CapacityKw, in.CapacityRatio).Scan(&id)
+		`INSERT INTO inverters(building_id,name,capacity_kw,capacity_ratio,model,supplier,warranty_months,install_date)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+		bid, in.Name, in.CapacityKw, in.CapacityRatio, in.Model, in.Supplier, in.WarrantyMonths, installDate).Scan(&id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -47,7 +64,8 @@ func (s *Server) listInverters(w http.ResponseWriter, r *http.Request) {
 	}
 	bid := urlID(r, "id")
 	rows, err := s.Pool.Query(r.Context(), `
-		SELECT id, name, capacity_kw, capacity_ratio, status, COALESCE(fault_note,''), fault_at
+		SELECT id, name, capacity_kw, capacity_ratio, status, COALESCE(fault_note,''), fault_at,
+			COALESCE(model,''), COALESCE(supplier,''), COALESCE(warranty_months,0), install_date
 		FROM inverters WHERE building_id=$1 ORDER BY id`, bid)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -59,15 +77,19 @@ func (s *Server) listInverters(w http.ResponseWriter, r *http.Request) {
 		var id int64
 		var name string
 		var kw, ratio float64
-		var status, note string
-		var faultAt *string
-		if err := rows.Scan(&id, &name, &kw, &ratio, &status, &note, &faultAt); err != nil {
+		var status, note, model, supplier string
+		var warrantyMonths int
+		var faultAt, installDate any
+		if err := rows.Scan(&id, &name, &kw, &ratio, &status, &note, &faultAt,
+			&model, &supplier, &warrantyMonths, &installDate); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
 		out = append(out, map[string]any{
 			"id": id, "name": name, "capacity_kw": kw, "capacity_ratio": ratio,
 			"status": status, "fault_note": note, "fault_at": faultAt,
+			"model": model, "supplier": supplier,
+			"warranty_months": warrantyMonths, "install_date": installDate,
 		})
 	}
 	writeJSON(w, 200, map[string]any{"items": out})
@@ -92,6 +114,63 @@ func (s *Server) faultInverter(w http.ResponseWriter, r *http.Request) {
 	}
 	if ct.RowsAffected() == 0 {
 		writeErr(w, 404, "逆变器不存在或已处于故障状态")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// updateInverterProfile 更新设备档案（型号/供应商/保修条款），供保修责任判定使用
+func (s *Server) updateInverterProfile(w http.ResponseWriter, r *http.Request) {
+	u := auth.RequireRole(w, r, "admin", "property")
+	if u == nil {
+		return
+	}
+	iid := urlID(r, "iid")
+	var in struct {
+		Model          *string `json:"model"`
+		Supplier       *string `json:"supplier"`
+		WarrantyMonths *int    `json:"warranty_months"`
+		InstallDate    *string `json:"install_date"` // YYYY-MM-DD，空串清空
+	}
+	if err := decodeJSON(r, &in); err != nil {
+		writeErr(w, 400, "请求格式错误")
+		return
+	}
+	var installArg any
+	clearInstall := false
+	if in.InstallDate != nil {
+		if *in.InstallDate == "" {
+			clearInstall = true
+		} else if t, err := time.Parse("2006-01-02", *in.InstallDate); err == nil {
+			installArg = t
+		} else {
+			writeErr(w, 400, "install_date 格式须为 YYYY-MM-DD")
+			return
+		}
+	}
+	var ct pgconn.CommandTag
+	var err error
+	if clearInstall {
+		ct, err = s.Pool.Exec(r.Context(), `
+			UPDATE inverters SET
+				model=COALESCE($2,model), supplier=COALESCE($3,supplier),
+				warranty_months=COALESCE($4,warranty_months), install_date=NULL
+			WHERE id=$1`,
+			iid, in.Model, in.Supplier, in.WarrantyMonths)
+	} else {
+		ct, err = s.Pool.Exec(r.Context(), `
+			UPDATE inverters SET
+				model=COALESCE($2,model), supplier=COALESCE($3,supplier),
+				warranty_months=COALESCE($4,warranty_months), install_date=COALESCE($5,install_date)
+			WHERE id=$1`,
+			iid, in.Model, in.Supplier, in.WarrantyMonths, installArg)
+	}
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		writeErr(w, 404, "逆变器不存在")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})

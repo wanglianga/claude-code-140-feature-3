@@ -201,3 +201,6 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .chart .lbl { font-size: 11px; color: var(--muted); }
 .back-link { margin-bottom: 12px; display: inline-block; }
 .list-empty { color: var(--muted); text-align: center; padding: 22px; font-size: 13px; }
+
+/* 故障分摊页：强调文字与迷你对比柱图 */
+.green-text { color: var(--primary); font-weight: 600; }

@@ -36,9 +36,10 @@ const STATUS_STYLE = {
   paid: 'green', pending: 'amber', refunded: 'red', transferred: 'blue',
   open: 'amber', closed: 'gray', resolved: 'green', processing: 'blue',
   approved: 'green', rejected: 'red',
-  finalized: 'green', draft: 'amber',
+  finalized: 'green',
   normal: 'green', faulty: 'red', maintenance: 'amber',
   explained: 'green',
+  covered: 'green', insufficient: 'red',
   shareholder: 'blue', public_only: 'gray',
 }
 export function Badge({ value }) {

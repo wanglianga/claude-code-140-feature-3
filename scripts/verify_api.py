@@ -94,6 +94,69 @@ def main():
     check("9月后公共账户=85920.78", approx(lg["public_balance"], 85920.78), str(lg["public_balance"]))
     check("9月后维修基金=23.26", approx(lg["maintenance_fund_balance"], 23.26), str(lg["maintenance_fund_balance"]))
 
+    # C2. 9 月 2# 逆变器质量故障：供应商保修赔付进入住户收益补偿
+    st, fl = call("GET", f"/api/buildings/{bid}/faults", prop)
+    check("故障台账1条", st == 200 and len(fl["items"]) == 1, str(len(fl["items"])))
+    fid = fl["items"][0]["id"]
+    st, f = call("GET", f"/api/faults/{fid}", prop)
+    check("故障停机168h/响应6h/SLA达标", approx(f["downtime_hours"], 168) and approx(f["response_hours"], 6) and f["sla_met"] is True)
+    check("责任=设备质量且保修内", f["cause"] == "quality" and f["warranty_covered"] is True)
+    check("损失电量490kWh", approx(f["lost_kwh"], 490), str(f["lost_kwh"]))
+    check("供应商赔付228.00", approx(f["supplier_compensation"], 228.00), str(f["supplier_compensation"]))
+    check("物业赔付为0", approx(f["property_compensation"], 0))
+    check("曲线已对比且覆盖", f["compare_status"] == "covered" and approx(f["recovery_ratio"], 97.14) and approx(f["cover_ratio"], 100))
+    check("待复查同型号1#逆变器", f["review_needed"] and (f["same_model_names"] or [""])[0] == "1#逆变器", str(f["same_model_names"]))
+    item_by_name = {i["name"]: i for i in f["items"]}
+    check("张伟质量赔付68.40", approx(item_by_name["张伟(顶楼)"]["supplier_amount"], 68.40))
+    check("李娜质量赔付57.00", approx(item_by_name["李娜"]["supplier_amount"], 57.00))
+    check("王强质量赔付34.20", approx(item_by_name["王强"]["supplier_amount"], 34.20))
+    pub_item = next(i for i in f["items"] if i["party"] == "public")
+    check("未认购公共组件赔付68.40入公共账", approx(pub_item["supplier_amount"], 68.40))
+    # 未做曲线/已发放保护：种子已对比为 covered，直接发放；重复发放 409
+    st, paid = call("POST", f"/api/faults/{fid}/pay", prop)
+    check("发放供应商赔付", st == 200 and paid["paid"] is True, str(st))
+    st, _ = call("POST", f"/api/faults/{fid}/pay", prop)
+    check("故障赔付不可重复发放(409)", st == 409, str(st))
+    st, me = call("GET", "/api/me", zhang)
+    check("张伟余额=605.59+68.40=673.99", approx(me["balance"], 673.99), str(me["balance"]))
+    st, lg = call("GET", f"/api/buildings/{bid}/ledger", prop)
+    check("发放后公共账户=85989.18(+公共组件68.40)", approx(lg["public_balance"], 85989.18), str(lg["public_balance"]))
+    st, _ = call("POST", f"/api/faults/{fid}/review", prop, {"note": "已巡检1#逆变器同型号模块"})
+    check("同型号设备复查登记", st == 200, str(st))
+
+    # C3. 10 月 1# 逆变器：屋顶维护通道占用致维修延迟，物业赔偿进公共账后代发住户
+    st, invall = call("GET", f"/api/buildings/{bid}/inverters", prop)
+    inv1_id = next(i["id"] for i in invall["items"] if i["name"] == "1#逆变器")
+    st, cf = call("POST", f"/api/buildings/{bid}/faults", prop, {
+        "inverter_id": inv1_id, "period_month": "2026-10",
+        "title": "屋顶维护通道被占用无法进场维修", "baseline_daily_kwh": 70,
+        "grid_price": 0.4153, "subsidy_per_kwh": 0.05,
+        "fault_at": "2026-10-20T08:00:00+08:00",
+    })
+    check("登记通道责任故障", st == 201, str(st))
+    cfid = cf["id"]
+    call("POST", f"/api/faults/{cfid}/respond", prop, {"responded_at": "2026-10-20T12:00:00+08:00"})
+    st, rr = call("POST", f"/api/faults/{cfid}/resolve", prop, {"resolved_at": "2026-10-21T08:00:00+08:00"})
+    check("通道故障停机24h", st == 200 and approx(rr["downtime_hours"], 24), str(rr))
+    st, fa = call("POST", f"/api/faults/{cfid}/assess", prop, {"cause": "channel"})
+    check("物业赔偿32.57入公共账", st == 200 and approx(fa["property_compensation"], 32.57), str(fa.get("property_compensation")))
+    check("通道责任供应商不赔", approx(fa["supplier_compensation"], 0) and fa["review_needed"] is False)
+    st, _ = call("POST", f"/api/faults/{cfid}/pay", prop)
+    check("未对比曲线不得发放(409)", st == 409, str(st))
+    st, cc = call("POST", f"/api/faults/{cfid}/compare-curve", prop, {"post_daily_kwh": 70})
+    check("曲线对比覆盖", st == 200 and cc["compare_status"] == "covered",
+          f"{cc.get('compare_status')} 恢复率{cc.get('recovery_ratio')}%")
+    st, _ = call("POST", f"/api/faults/{cfid}/pay", prop)
+    check("物业赔偿发放", st == 200, str(st))
+    st, lg = call("GET", f"/api/buildings/{bid}/ledger?period_month=2026-10", prop)
+    fc = [x for x in lg["items"] if x["category"] == "fault_comp"]
+    check("公共账先收物业赔偿32.57", any(x["party"] == "公共账户" and x["direction"] == "in" and approx(x["amount"], 32.57) for x in fc))
+    check("公共账代发住户22.80(70%)", approx(sum(x["amount"] for x in fc if x["party"] == "公共账户" and x["direction"] == "out"), 22.80))
+    zhang_fc = [x for x in fc if x["party"].startswith("张伟")]
+    check("张伟获通道赔偿9.77(30%)", approx(sum(x["amount"] for x in zhang_fc), 9.77))
+    st, me = call("GET", "/api/me", zhang)
+    check("张伟余额=673.99+9.77=683.76", approx(me["balance"], 683.76), str(me["balance"]))
+
     # D. 房屋转让：张伟 -> 刘洋
     st, subs = call("GET", f"/api/buildings/{bid}/subscriptions", prop)
     sid = next(x["id"] for x in subs["items"] if x["name"].startswith("张伟") and x["type"] == "shareholder")
@@ -127,7 +190,7 @@ def main():
     st, me = call("GET", "/api/me", liu)
     check("刘洋余额=335.02", approx(me["balance"], 335.02), str(me["balance"]))
     st, me = call("GET", "/api/me", zhang)
-    check("张伟余额保持605.59（历史收益不转移）", approx(me["balance"], 605.59), str(me["balance"]))
+    check("张伟余额保持683.76（历史收益+故障赔付，不随转让转移）", approx(me["balance"], 683.76), str(me["balance"]))
 
     # F. 公告 / 异议 / 异常解释 / 年报
     st, _ = call("POST", f"/api/buildings/{bid}/announcements", prop,
